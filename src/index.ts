@@ -1,4 +1,5 @@
-import { Context, Schema, Dict, Time } from 'koishi'
+import { h, Context, Schema, Dict, Time, Random } from 'koishi'
+import { config } from 'process'
 
 export const name = 'group-manage'
 
@@ -11,12 +12,8 @@ interface BlockingRule {
   tip: boolean
 }
 
-export interface Config {
-  blockingRules: Dict<BlockingRule, string>
-  banDuration: number
-}
 
-export const Config: Schema<Config> = Schema.intersect([
+export const Config = Schema.intersect([
   Schema.object({
     blockingRules: Schema.dict(Schema.object({
       enable: Schema.boolean().description('是否启用').default(true),
@@ -28,8 +25,18 @@ export const Config: Schema<Config> = Schema.intersect([
     }).description('群组平台与群组 ID, 格式:`platform:guildId`, 例如:`red:123456`')).description('规则列表'),
   }).description('违禁词检测设置'),
   Schema.object({
+    isAdmin: Schema.boolean().default(true).description('指令是否需要该群的管理员权限'),
     banDuration: Schema.natural().role('ms').description('ban 和 ban-me 指令默认禁言时长 (单位为毫秒)').default(15 * Time.hour),
-  }).description('指令默认值设置')
+    autoUnban: Schema.boolean().default(false).description('是否自动解除自我禁言'),
+  }).description('指令默认值设置'),
+  Schema.union([
+    Schema.object({
+      autoUnban: Schema.const(true).required(),
+      minTimeout: Schema.number().default(60000).description('自动解除自我禁言最少间隔时间'),
+      maxTimeout: Schema.number().default(300000).description('自动解除自我禁言最多间隔时间'),
+    }),
+    Schema.object({})
+  ])
 ])
 
 export const usage: string = `
@@ -38,9 +45,15 @@ export const usage: string = `
 权限设置教程: https://koishi.chat/zh-CN/manual/usage/customize.html#%E7%94%A8%E6%88%B7%E6%9D%83%E9%99%90
 `
 
-export function apply(ctx: Context, cfg: Config) {
+export function apply(ctx: Context, cfg) {
   ctx.i18n.define('zh-CN', require('./locales/zh-CN'))
-
+  async function checkManage(session) {
+    if (!session.guild) {
+      return true
+    }
+    const info = await session.onebot.getGroupMemberInfo(session.guildId, session.userId)
+    return info.role == 'admin' || info.role == 'owner'
+  }
   ctx.middleware(async (session, next) => {
     if (session.gid in cfg.blockingRules) {
       const rule = cfg.blockingRules[session.gid]
@@ -49,12 +62,7 @@ export function apply(ctx: Context, cfg: Config) {
       let hit = false
       for (const word of rule.blockingWords) {
         const re = new RegExp(word)
-        const include = session.event.message.elements.some(value => {
-          if (value.type === 'text') {
-            return re.test(value.attrs.content)
-          }
-          return false
-        })
+        const include = re.test(session.content)
         if (include) {
           hit = true
           break
@@ -65,8 +73,16 @@ export function apply(ctx: Context, cfg: Config) {
         rule.tip && await session.send(session.text('group-manage.blocking-word.hit'))
         const { event } = session
         if (rule.recall) {
-          await session.bot.deleteMessage(event.channel.id, event.message.id)
-          rule.tip && await session.send(session.text('group-manage.blocking-word.recall'))
+          try{
+            await session.bot.deleteMessage(event.channel.id, event.message.id)
+            rule.tip && await session.send(session.text('group-manage.blocking-word.recall'))
+          }
+          catch(e) {
+            const pics = h.select(session.content, 'img')
+            if (pics.length > 0) {
+              session.execute('meme.generate.kiss ' + h.image(session.event.user.avatar) + pics[0])
+            }
+          }
         }
         if (rule.mute) {
           await session.bot.muteGuildMember(event.guild.id, event.user.id, rule.muteDuration)
@@ -80,63 +96,69 @@ export function apply(ctx: Context, cfg: Config) {
 
   const command = ctx.command('group-manage')
 
-  command.subcommand('ban <user:user> <duration:posint> <unit>', { authority: 3 })
-    .alias('mute', '禁言')
-    .action(async ({ session }, user, duration, unit) => {
+  command.subcommand('ban <user:user> <duration:text>', { authority: 3 })
+    .alias('mute', '禁言').userFields(['authority'])
+    .action(async ({ session }, user, duration) => {
+      if (session.user.authority == 3 && cfg.isAdmin && !(await checkManage(session)))
+        return '权限不足'
       if (!user) return session.text('.missing-user')
+      let time;
       if (!duration) {
-        duration = cfg.banDuration
+        time = cfg.banDuration
       } else {
-        duration = parseDuration(duration, unit)
-        if (duration === undefined) return session.text('.missing-duration')
+        time = parseDuration(duration)
+        if (time === 0) return session.text('.missing-duration')
       }
       const userId = user.replace(session.platform + ':', '')
-      await session.bot.muteGuildMember(session.guildId, userId, duration)
-      return session.text('.executed')
+      await session.bot.muteGuildMember(session.guildId, userId, time)
+      // return session.text('.executed')
     })
 
-  command.subcommand('ban-me <duration:posint> <unit>')
+  command.subcommand('ban-me <duration:text>')
     .alias('self-ban', 'mute-me', '自我禁言')
-    .action(async ({ session }, duration, unit) => {
+    .action(async ({ session }, duration) => {
+      let time
       if (!duration) {
-        duration = cfg.banDuration
+        time = cfg.banDuration
       } else {
-        duration = parseDuration(duration, unit)
-        if (duration === undefined) return session.text('.missing-duration')
+        time = parseDuration(duration)
+        if (time === 0) return session.text('.missing-duration')
       }
-      await session.bot.muteGuildMember(session.guildId, session.userId, duration)
-      return session.text('.executed')
+      await session.bot.muteGuildMember(session.guildId, session.userId, time)
+      if (time > cfg.maxTimeout) {
+        ctx.setTimeout(() => {
+          session.bot.muteGuildMember(session.guildId, session.userId, 0)
+        }, Random.int(cfg.minTimeout, cfg.maxTimeout))
+      }
+      // return session.text('.executed')
     })
 
   command.subcommand('unban <user:user>', { authority: 3 })
-    .alias('unmute', '取消禁言')
+    .alias('unmute', '取消禁言').userFields(['authority'])
     .action(async ({ session }, user) => {
+      if (session.user.authority == 3 && cfg.isAdmin && !(await checkManage(session)))
+        return '权限不足'
       if (!user) return session.text('.missing-user')
       const userId = user.replace(session.platform + ':', '')
       await session.bot.muteGuildMember(session.guildId, userId, 0)
-      return session.text('.executed')
+      // return session.text('.executed')
     })
 
   command.subcommand('delmsg', { authority: 3 })
-    .alias('撤回消息')
+    .alias('撤回消息').userFields(['authority'])
     .action(async ({ session }) => {
+      if (session.user.authority == 3 && cfg.isAdmin && !(await checkManage(session)))
+        return '权限不足'
       if (!session.quote) return session.text('.missing-quote')
       await session.bot.deleteMessage(session.channelId, session.quote.id)
-      return session.text('.executed')
-    })
-
-  command.subcommand('kick <user:user>', { authority: 3 })
-    .alias('踢', '踢出群聊')
-    .action(async ({ session }, user) => {
-      if (!user) return session.text('.missing-user')
-      const userId = user.replace(session.platform + ':', '')
-      await session.bot.kickGuildMember(session.guildId, userId)
-      return session.text('.executed')
+      // return session.text('.executed')
     })
 
   command.subcommand('mute-all', { authority: 3 })
-    .alias('全员禁言')
+    .alias('全员禁言').userFields(['authority'])
     .action(async ({ session }) => {
+      if (session.user.authority == 3 && cfg.isAdmin && !(await checkManage(session)))
+        return '权限不足'
       const { platform, guildId } = session
       switch (platform) {
         case 'red':
@@ -154,12 +176,14 @@ export function apply(ctx: Context, cfg: Config) {
         default:
           return session.text('.unsupported-platform')
       }
-      return session.text('.executed')
+      // return session.text('.executed')
     })
 
   command.subcommand('unmute-all', { authority: 3 })
-    .alias('取消全员禁言')
+    .alias('取消全员禁言').userFields(['authority'])
     .action(async ({ session }) => {
+      if (session.user.authority == 3 && cfg.isAdmin && !(await checkManage(session)))
+        return '权限不足'
       const { platform, guildId } = session
       switch (platform) {
         case 'red':
@@ -177,28 +201,34 @@ export function apply(ctx: Context, cfg: Config) {
         default:
           return session.text('.unsupported-platform')
       }
-      return session.text('.executed')
+      // return session.text('.executed')
     })
 }
 
-function parseDuration(duration: number, unit: string): number | undefined {
-  switch (unit) {
-    case '秒':
-    case '秒钟':
-    case 's':
-      return duration * 1000
-    case '分':
-    case '分钟':
-    case 'min':
-      return duration * 60 * 1000
-    case '时':
-    case '小时':
-    case 'h':
-      return duration * 60 * 60 * 1000
-    case '天':
-    case 'd':
-      return duration * 24 * 60 * 60 * 1000
-    default:
-      return undefined
+function parseDuration(duration: string): number | undefined {
+  var time = 0
+  const Reglist = [
+    {
+      'pattern': /(\d+)\s*[分|分钟|min|m]/gim,
+      'unit': 60 * 1000
+    },
+    {
+      'pattern': /(\d+)\s*[时|小时|hour|h]/gim,
+      'unit': 60 * 60 * 1000
+    },
+    {
+      'pattern': /(\d+)\s*[天|day|d]/gim,
+      'unit': 24 * 60 * 60 * 1000
+    }
+  ]
+  for (const reg of Reglist) {
+    let match
+    while (match = reg.pattern.exec(duration)) {
+      // console.log(match)
+      time += reg.unit * parseInt(match[1])
+    }
   }
+  time = Math.min(time, ((29 * 24 + 23) * 60 + 59) * 60 * 1000)
+  // console.log(time)
+  return time
 }
